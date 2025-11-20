@@ -21,7 +21,7 @@ DEFAULT_DOWNLOAD_DIR = ""
 DEFAULT_MAX_THREADS = 8
 DEFAULT_TIMEOUT = 20
 DEFAULT_DB_FILE = "downloads.db"
-DEFAULT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+DEFAULT_USER_AGENT = "downloaded using https://github.com/WaffleThief123/myrient-downloader by a user who did not bother to modify the user agent"
 
 # --- Helper Functions ---
 
