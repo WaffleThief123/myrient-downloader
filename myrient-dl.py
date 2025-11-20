@@ -16,8 +16,8 @@ except ImportError:
     pass  # .env file support is optional
 
 # --- Default Configuration ---
-DEFAULT_BASE_URL = "https://myrient.erista.me/files/No-Intro/Nintendo%20-%20Game%20Boy%20Advance/"
-DEFAULT_DOWNLOAD_DIR = "./Nintendo_GameBoyAdvance"
+DEFAULT_BASE_URL = ""
+DEFAULT_DOWNLOAD_DIR = ""
 DEFAULT_MAX_THREADS = 8
 DEFAULT_TIMEOUT = 20
 DEFAULT_DB_FILE = "downloads.db"
