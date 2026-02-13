@@ -386,10 +386,16 @@ def main():
             sys.exit(0)
 
         # Normal download mode
+        total_files = len(files)
+        completed = 0
+        print(f"[INFO] Starting download of {total_files} files with {config['max_threads']} threads...")
         with ThreadPoolExecutor(max_workers=config['max_threads']) as executor:
             futures = [executor.submit(download_file, url, config, db, session) for url in files]
             for future in as_completed(futures):
+                completed += 1
                 rel_path = future.result()
+                if completed % 50 == 0 or completed == total_files:
+                    print(f"[INFO] Progress: {completed}/{total_files} files processed.")
                 if rel_path and rel_path.lower().endswith(".zip"):
                     zip_path = os.path.join(config['download_dir'], rel_path)
                     if os.path.exists(zip_path):
