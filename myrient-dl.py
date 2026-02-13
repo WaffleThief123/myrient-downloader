@@ -1,10 +1,15 @@
 import os
+import re
+import time
 import zipfile
 import requests
+import requests.adapters
 import sqlite3
 import argparse
 import sys
+import threading
 from urllib.parse import urljoin, unquote
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from bs4 import BeautifulSoup
 
@@ -22,6 +27,94 @@ DEFAULT_MAX_THREADS = 8
 DEFAULT_TIMEOUT = 20
 DEFAULT_DB_FILE = "downloads.db"
 DEFAULT_USER_AGENT = "downloaded using https://github.com/WaffleThief123/myrient-downloader by a user who did not bother to modify the user agent"
+
+CHUNK_SIZE = 1024 * 1024  # 1MB chunks for download streaming
+MAX_RETRIES = 3
+
+REGION_ALIASES = {
+    'EU': 'Europe', 'JP': 'Japan', 'JPN': 'Japan',
+    'AUS': 'Australia', 'KR': 'Korea', 'BR': 'Brazil',
+    'CN': 'China', 'FR': 'France', 'DE': 'Germany',
+    'HK': 'Hong Kong', 'IT': 'Italy', 'NL': 'Netherlands',
+    'ES': 'Spain', 'SE': 'Sweden', 'CA': 'Canada',
+}
+
+
+# --- Database Manager ---
+
+class DatabaseManager:
+    """Thread-safe SQLite database manager using a single shared connection."""
+
+    def __init__(self, db_file):
+        self.db_file = db_file
+        self._lock = threading.Lock()
+        self._conn = None
+
+    def initialize(self):
+        """Create/open the database and ensure schema is up to date."""
+        self._conn = sqlite3.connect(self.db_file, check_same_thread=False)
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        cursor = self._conn.cursor()
+
+        cursor.execute('''
+        CREATE TABLE IF NOT EXISTS downloads (
+            url TEXT PRIMARY KEY,
+            filename TEXT,
+            full_path TEXT,
+            download_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            file_size INTEGER,
+            status TEXT DEFAULT 'completed'
+        )
+        ''')
+
+        # Migrate existing databases: add full_path column if it doesn't exist
+        try:
+            cursor.execute("ALTER TABLE downloads ADD COLUMN full_path TEXT")
+        except sqlite3.OperationalError:
+            # Column already exists, which is fine
+            pass
+
+        self._conn.commit()
+
+    def file_exists(self, url, download_dir):
+        """Check if a file URL already exists in the database and the file exists on disk."""
+        with self._lock:
+            cursor = self._conn.cursor()
+            cursor.execute("SELECT filename FROM downloads WHERE url = ?", (url,))
+            result = cursor.fetchone()
+
+        if result is None:
+            return False
+
+        filename = result[0]
+        # ZIP files get extracted and deleted - trust the DB record
+        if filename.lower().endswith(".zip"):
+            return True
+
+        local_path = os.path.join(download_dir, filename)
+        return os.path.exists(local_path)
+
+    def save_file(self, url, filename, download_dir):
+        """Save the download record to the database."""
+        local_path = os.path.join(download_dir, filename)
+        full_path = os.path.abspath(local_path)
+        file_size = os.path.getsize(local_path) if os.path.exists(local_path) else None
+
+        with self._lock:
+            self._conn.execute(
+                """INSERT OR REPLACE INTO downloads
+                   (url, filename, full_path, download_date, file_size, status)
+                   VALUES (?, ?, ?, CURRENT_TIMESTAMP, ?, ?)""",
+                (url, filename, full_path, file_size, 'completed')
+            )
+            self._conn.commit()
+
+    def close(self):
+        """Close the database connection."""
+        if self._conn:
+            self._conn.close()
+            self._conn = None
+
 
 # --- Helper Functions ---
 
@@ -87,9 +180,28 @@ def parse_args(config):
         default=config['user_agent'],
         help="User agent string for HTTP requests (default: from .env or default browser UA)"
     )
-    
+    parser.add_argument(
+        "-r",
+        "--region",
+        nargs="*",
+        default=None,
+        help="Filter downloads to specific regions (e.g. -r USA EU JP). Aliases like EU=Europe, JP=Japan are supported. Env var: REGION (comma-separated)"
+    )
+
     args = parser.parse_args()
-    
+
+    # Resolve region filter: CLI takes priority, then env var
+    if args.region is not None:
+        raw_regions = args.region
+    else:
+        env_region = os.getenv('REGION', '')
+        raw_regions = [r.strip() for r in env_region.split(',') if r.strip()] if env_region else None
+
+    if raw_regions:
+        args.region = [REGION_ALIASES.get(r.upper(), r) for r in raw_regions]
+    else:
+        args.region = None
+
     # Update config with CLI overrides
     config['base_url'] = args.url
     config['download_dir'] = args.download_dir
@@ -97,155 +209,118 @@ def parse_args(config):
     config['timeout'] = args.timeout
     config['db_file'] = args.db_file
     config['user_agent'] = args.user_agent
-    
+
     return args, config
 
-def initialize_db(db_file):
-    """Initialize the SQLite database and create the 'downloads' table if it doesn't exist."""
-    conn = sqlite3.connect(db_file)
-    cursor = conn.cursor()
-
-    cursor.execute('''
-    CREATE TABLE IF NOT EXISTS downloads (
-        url TEXT PRIMARY KEY,
-        filename TEXT,
-        full_path TEXT,
-        download_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        file_size INTEGER,
-        status TEXT DEFAULT 'completed'
-    )
-    ''')
-
-    # Migrate existing databases: add full_path column if it doesn't exist
-    try:
-        cursor.execute("ALTER TABLE downloads ADD COLUMN full_path TEXT")
-    except sqlite3.OperationalError:
-        # Column already exists, which is fine
-        pass
-
-    conn.commit()
-    conn.close()
-
-def file_exists_in_db(url, db_file, download_dir):
-    """Check if a file URL already exists in the database and the file exists on disk."""
-    conn = sqlite3.connect(db_file)
-    cursor = conn.cursor()
-    
-    cursor.execute("SELECT filename FROM downloads WHERE url = ?", (url,))
-    result = cursor.fetchone()
-    conn.close()
-    
-    if result is None:
-        return False
-    
-    # Also verify the file actually exists on disk
-    filename = result[0]
-    local_path = os.path.join(download_dir, filename)
-    return os.path.exists(local_path)
-
-def save_file_to_db(url, filename, db_file, download_dir):
-    """Save the URL, filename, full path, and timestamp of the successfully downloaded file into the database."""
-    conn = sqlite3.connect(db_file)
-    cursor = conn.cursor()
-
-    local_path = os.path.join(download_dir, filename)
-    full_path = os.path.abspath(local_path)  # Store absolute path
-    file_size = os.path.getsize(local_path) if os.path.exists(local_path) else None
-
-    # Use INSERT OR REPLACE with explicit timestamp to update download_date on re-downloads
-    cursor.execute(
-        """INSERT OR REPLACE INTO downloads 
-           (url, filename, full_path, download_date, file_size, status) 
-           VALUES (?, ?, ?, CURRENT_TIMESTAMP, ?, ?)""",
-        (url, filename, full_path, file_size, 'completed')
-    )
-
-    conn.commit()
-    conn.close()
-
-def get_links(url, base_url, timeout, user_agent):
-    """Recursively collect all files under base_url."""
-    print(f"[INFO] Scanning directory: {url}")
-    try:
-        headers = {'User-Agent': user_agent}
-        resp = requests.get(url, timeout=timeout, headers=headers)
-        resp.raise_for_status()
-    except Exception as e:
-        print(f"[ERROR] Failed to list {url}: {e}")
-        return []
-
-    soup = BeautifulSoup(resp.text, "html.parser")
+def get_links(base_url, timeout, session):
+    """Collect all file links under base_url using iterative BFS."""
     links = []
+    queue = deque([base_url])
+    visited = set()
 
-    for a in soup.find_all("a", href=True):
-        href = a["href"]
-
-        # Skip parent dirs, query links, and index pages
-        if href in ("../", "./", "/", "index.html", "index.htm"):
+    while queue:
+        url = queue.popleft()
+        if url in visited:
             continue
-        if "?" in href:
+        visited.add(url)
+
+        print(f"[INFO] Scanning directory: {url}")
+        try:
+            resp = session.get(url, timeout=timeout)
+            resp.raise_for_status()
+        except Exception as e:
+            print(f"[ERROR] Failed to list {url}: {e}")
             continue
 
-        full_url = urljoin(url, href)
+        soup = BeautifulSoup(resp.text, "html.parser")
 
-        # Only recurse within the base path
-        if not full_url.startswith(base_url):
-            continue
+        for a in soup.find_all("a", href=True):
+            href = a["href"]
 
-        if href.endswith("/"):
-            links.extend(get_links(full_url, base_url, timeout, user_agent))
-        else:
-            links.append(full_url)
+            # Skip parent dirs, query links, and index pages
+            if href in ("../", "./", "/", "index.html", "index.htm"):
+                continue
+            if "?" in href:
+                continue
+
+            full_url = urljoin(url, href)
+
+            # Only recurse within the base path
+            if not full_url.startswith(base_url):
+                continue
+
+            if href.endswith("/"):
+                if full_url not in visited:
+                    queue.append(full_url)
+            else:
+                links.append(full_url)
 
     return links
 
 def clean_filename(url, base_url):
     """Return a decoded, filesystem-safe filename path relative to base_url."""
-    rel_path = url.replace(base_url, "")
+    rel_path = url.replace(base_url, "", 1)
     rel_path = unquote(rel_path)
     rel_path = rel_path.strip("/")
     return rel_path
 
-def download_file(url, config):
+def matches_region(filename, regions):
+    """Check if a filename's region tag matches any of the specified regions.
+
+    Extracts the first parenthesized group (the region tag in No-Intro/Redump naming)
+    and checks if any specified region appears in it (case-insensitive).
+    """
+    match = re.search(r'\(([^)]+)\)', filename)
+    if not match:
+        return False
+    region_tag = match.group(1).lower()
+    return any(r.lower() in region_tag for r in regions)
+
+def download_file(url, config, db, session):
     """Download a single file if not already present in the database and on disk."""
     base_url = config['base_url']
     download_dir = config['download_dir']
-    db_file = config['db_file']
     timeout = config['timeout']
-    user_agent = config['user_agent']
-    
+
     # Check if already downloaded
-    if file_exists_in_db(url, db_file, download_dir):
+    if db.file_exists(url, download_dir):
         rel_path = clean_filename(url, base_url)
         print(f"[SKIP] {rel_path} already downloaded.")
         return rel_path
 
     rel_path = clean_filename(url, base_url)
     local_path = os.path.join(download_dir, rel_path)
-    os.makedirs(os.path.dirname(local_path), exist_ok=True)
+    dir_path = os.path.dirname(local_path)
+    if dir_path:
+        os.makedirs(dir_path, exist_ok=True)
 
-    try:
-        headers = {'User-Agent': user_agent}
-        with requests.get(url, stream=True, timeout=timeout, headers=headers) as r:
-            r.raise_for_status()
-            with open(local_path, "wb") as f:
-                for chunk in r.iter_content(chunk_size=8192):
-                    if chunk:
-                        f.write(chunk)
-        print(f"[OK]   {rel_path}")
+    for attempt in range(MAX_RETRIES):
+        try:
+            with session.get(url, stream=True, timeout=timeout) as r:
+                r.raise_for_status()
+                with open(local_path, "wb") as f:
+                    for chunk in r.iter_content(chunk_size=CHUNK_SIZE):
+                        if chunk:
+                            f.write(chunk)
+            print(f"[OK]   {rel_path}")
 
-        # Save to database after successful download
-        save_file_to_db(url, rel_path, db_file, download_dir)
-        return rel_path
-    except Exception as e:
-        print(f"[FAIL] {rel_path} - {e}")
-        # Clean up partial download if it exists
-        if os.path.exists(local_path):
-            try:
-                os.remove(local_path)
-            except:
-                pass
-        return None
+            # Save to database after successful download
+            db.save_file(url, rel_path, download_dir)
+            return rel_path
+        except Exception as e:
+            if attempt < MAX_RETRIES - 1:
+                wait = 2 ** attempt
+                print(f"[RETRY] {rel_path} - attempt {attempt + 1}/{MAX_RETRIES} failed: {e}, retrying in {wait}s...")
+                time.sleep(wait)
+            else:
+                print(f"[FAIL] {rel_path} - {e}")
+                # Clean up partial download if it exists
+                if os.path.exists(local_path):
+                    try:
+                        os.remove(local_path)
+                    except OSError:
+                        pass
+                return None
 
 def unzip_file(zip_path):
     """Unzip the file and delete the ZIP afterward."""
@@ -263,31 +338,67 @@ def unzip_file(zip_path):
 def main():
     # Load config from .env file
     config = load_config()
-    
+
     # Parse CLI arguments (will override .env values)
     args, config = parse_args(config)
 
-    initialize_db(config['db_file'])
+    # Validate required config
+    if not config['base_url']:
+        print("[ERROR] No base URL specified. Use -u/--url or set BASE_URL in .env")
+        sys.exit(1)
+    if not config['download_dir']:
+        print("[ERROR] No download directory specified. Use -d/--download-dir or set DOWNLOAD_DIR in .env")
+        sys.exit(1)
 
-    print(f"[INFO] Fetching file list from {config['base_url']} ...")
-    files = get_links(config['base_url'], config['base_url'], config['timeout'], config['user_agent'])
-    print(f"[INFO] Found {len(files)} files.")
+    # Ensure base_url ends with / for consistent URL handling
+    if not config['base_url'].endswith('/'):
+        config['base_url'] += '/'
 
-    # If -c, show the count and exit
-    if args.count:
-        print(len(files))
-        sys.exit(0)
+    db = DatabaseManager(config['db_file'])
+    db.initialize()
 
-    # Normal download mode
-    with ThreadPoolExecutor(max_workers=config['max_threads']) as executor:
-        futures = [executor.submit(download_file, url, config) for url in files]
-        for future in as_completed(futures):
-            rel_path = future.result()
-            if rel_path and rel_path.endswith(".zip"):
-                zip_path = os.path.join(config['download_dir'], rel_path)
-                unzip_file(zip_path)
+    # Create a shared HTTP session for connection pooling
+    session = requests.Session()
+    session.headers.update({'User-Agent': config['user_agent']})
 
-    print("[DONE] All downloads completed.")
+    # Size the connection pool to match thread count
+    adapter = requests.adapters.HTTPAdapter(
+        pool_connections=config['max_threads'],
+        pool_maxsize=config['max_threads'],
+    )
+    session.mount('https://', adapter)
+    session.mount('http://', adapter)
+
+    try:
+        print(f"[INFO] Fetching file list from {config['base_url']} ...")
+        files = get_links(config['base_url'], config['timeout'], session)
+        print(f"[INFO] Found {len(files)} files.")
+
+        # Apply region filter if specified
+        if args.region:
+            total = len(files)
+            files = [f for f in files if matches_region(unquote(f.split('/')[-1]), args.region)]
+            print(f"[INFO] Region filter {args.region}: {len(files)}/{total} files matched.")
+
+        # If -c, show the count and exit
+        if args.count:
+            print(len(files))
+            sys.exit(0)
+
+        # Normal download mode
+        with ThreadPoolExecutor(max_workers=config['max_threads']) as executor:
+            futures = [executor.submit(download_file, url, config, db, session) for url in files]
+            for future in as_completed(futures):
+                rel_path = future.result()
+                if rel_path and rel_path.lower().endswith(".zip"):
+                    zip_path = os.path.join(config['download_dir'], rel_path)
+                    if os.path.exists(zip_path):
+                        unzip_file(zip_path)
+
+        print("[DONE] All downloads completed.")
+    finally:
+        session.close()
+        db.close()
 
 if __name__ == "__main__":
     main()
