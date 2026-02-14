@@ -23,10 +23,10 @@ except ImportError:
 # --- Default Configuration ---
 DEFAULT_BASE_URL = ""
 DEFAULT_DOWNLOAD_DIR = ""
-DEFAULT_MAX_THREADS = 8
-DEFAULT_TIMEOUT = 20
+DEFAULT_MAX_THREADS = 3
+DEFAULT_TIMEOUT = 30
 DEFAULT_DB_FILE = "downloads.db"
-DEFAULT_USER_AGENT = "downloaded using https://github.com/WaffleThief123/myrient-downloader by a user who did not bother to modify the user agent"
+DEFAULT_USER_AGENT = "Wget/1.21.3"
 
 CHUNK_SIZE = 1024 * 1024  # 1MB chunks for download streaming
 MAX_RETRIES = 3
